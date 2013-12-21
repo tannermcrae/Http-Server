@@ -1,0 +1,367 @@
+
+const char * usage =
+"                                                               \n"
+"myhttpd                                                        \n"
+"                                                               \n"
+"Simple server program that shows how to use socket calls       \n"
+"in the server side.                                            \n"
+"                                                               \n"
+"To use it in one window type:                                  \n"
+"                                                               \n"
+"myhttpd [-f|-t|-p] [<port>]                                    \n"
+"    -f to run with processes                                   \n"
+"    -t to run with threads                                     \n"
+"    -p to run with thread pools                                \n"
+"                                                               \n"
+"Where 1024 < port < 65536.                                     \n"
+"                                                               \n"
+"In another window type:                                        \n"
+"                                                               \n"
+"   telnet <host> <port>                                        \n"
+"                                                               \n"
+"where <host> is the name of the machine where daytime-server   \n"
+"is running. <port> is the port number you used when you run    \n"
+"daytime-server.                                                \n"
+"                                                               \n"
+"Then GET <document> <crlf><crlf> to have the doc returned      \n"
+"You can also type <machine_name>:<port>/<document> in a browser\n"
+"to have the file show up in the browser                        \n"
+"                                                               \n";
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <netdb.h> 
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <dirent.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include "write_functions.h"
+
+void sigHandler(int sig);
+
+void processRequest( int socket );
+void processRequestThread( int socket);
+int cmpReversedString(char *revString, char *fileExt);
+void poolSlave(int socket);
+
+int QueueLength = 5;
+pthread_mutex_t mutex;
+struct sigaction sigAction;
+
+void sigHandler(int sig) {
+   int status;
+   if (sig == SIGCHLD) {
+      while(waitpid(-1, &status, WNOHANG) > 0);
+   }
+}
+
+int main( int argc, char ** argv ) {
+
+	// Create signal handler for zombie processes
+	sigAction.sa_handler = sigHandler;
+	sigemptyset(&sigAction.sa_mask);
+	sigAction.sa_flags = SA_RESTART;
+
+  // Default normal mode
+	int mode = 0; 
+  // default?
+	int port = 1026;
+
+	// Check for a flag. If it's not a flag then argv[1] is the port number.
+	if (argc > 1) {
+	  if (strcmp(argv[1], "-f") == 0)
+			mode = 1;
+	  else if (strcmp(argv[1], "-t") == 0)
+	  	mode = 2;
+	  else if (strcmp(argv[1], "-p") == 0)
+	  	mode = 3;
+	  else
+	    port = atoi( argv[1] );
+	}
+	// Argv[2] specifies the port number. 
+	if(argv[2])
+		port = atoi(argv[2]);
+
+	fprintf(stderr, "mode %d\n", mode);
+ 	fprintf(stderr, "port %d\n", port);
+  
+  // Set the IP address and port for this server
+  struct sockaddr_in serverIPAddress; 
+  memset( &serverIPAddress, 0, sizeof(serverIPAddress) );
+  serverIPAddress.sin_family = AF_INET;
+  serverIPAddress.sin_addr.s_addr = INADDR_ANY;
+  serverIPAddress.sin_port = htons((u_short) port);
+  
+  // Allocate a socket
+  int masterSocket =  socket(PF_INET, SOCK_STREAM, 0);
+  if ( masterSocket < 0) {
+    perror("socket");
+    exit( -1 );
+  }
+
+  // Set socket options to reuse port. Otherwise we will
+  // have to wait about 2 minutes before reusing the sae port number
+  int optval = 1; 
+  int err = setsockopt(masterSocket, SOL_SOCKET, SO_REUSEADDR, 
+											(char *) &optval, sizeof( int ) );
+   
+  // Bind the socket to the IP address and port
+  int error = bind( masterSocket,
+		    					(struct sockaddr *)&serverIPAddress,
+		    					sizeof(serverIPAddress) );
+  if ( error ) {
+    perror("bind");
+    exit( -1 );
+  }
+  
+  // Put socket in listening mode and set the 
+  // size of the queue of unprocessed connections
+  error = listen( masterSocket, QueueLength);
+  if ( error ) {
+    perror("listen");
+    exit( -1 );
+  }
+  // Start the listeners
+  listenForRequests(mode);
+  return 0;
+}
+
+
+void listenForRequests(int mode) {
+	if (mode == 0) {
+	  while ( 1 ) {
+			// Accept incoming connections
+			struct sockaddr_in clientIPAddress;
+			int alen = sizeof( clientIPAddress );
+			int slaveSocket = accept( masterSocket,
+			                        (struct sockaddr *)&clientIPAddress,
+			                        (socklen_t*)&alen);
+
+			if ( slaveSocket < 0 ) {
+			  perror( "accept" );
+			  exit( -1 );
+			}
+			processRequest( slaveSocket );
+			close(slaveSocket);
+	  }
+	}
+
+	else if (mode == 1) {
+	  while ( 1 ) {
+		// Accept incoming connections
+    struct sockaddr_in clientIPAddress;
+		int alen = sizeof( clientIPAddress );
+		int slaveSocket = accept( masterSocket,
+		                        (struct sockaddr *)&clientIPAddress,
+		                        (socklen_t*)&alen);
+
+		if (slaveSocket < 0) {
+		  if (slaveSocket == -1 && errno == EINTR) continue;
+		  perror( "accept" );
+		  exit( -1 );
+		}
+    pid_t slave = fork();
+    if (slave==0) {
+      processRequest(slaveSocket);
+      close(slaveSocket);
+      exit(0);
+    }
+    // Fork error
+    else if (slave < 0) {
+      perror("fork");
+      exit(-1);
+    }
+    // Clean up zombie processes
+    int z_error = sigaction(SIGCHLD, &sigAction, NULL);
+    if ( z_error ) {
+      perror( "sigaction" );
+      exit(-1);
+    }
+    close(slaveSocket);
+	  }
+	}
+	else if (mode == 2) {
+	  while (1) {
+	     // Accept incoming connections
+	     fprintf(stderr, "testing1\n" );
+	     struct sockaddr_in clientIPAddress;
+	     int alen = sizeof( clientIPAddress );
+	     int slaveSocket = accept( masterSocket,
+	                           (struct sockaddr *)&clientIPAddress,
+	                           (socklen_t*)&alen);
+	           fprintf(stderr, "testing2\n" );
+
+	     if ( slaveSocket < 0 ) {
+	        perror( "accept" );
+	        exit( -1 );
+	     }
+	     pthread_t thr;
+	     pthread_attr_t attr;
+	     pthread_attr_init(&attr);
+	     pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM);
+	     pthread_create(&thr, &attr, (void * (*) (void *))processRequestThread, (void *)slaveSocket);
+	  }
+	}
+
+	else {
+	  // Using poolthreads
+	  pthread_mutex_init(&mutex, NULL);
+	  pthread_attr_t attr;
+	  pthread_attr_init(&attr);
+	  pthread_attr_setscope(&attr, PTHREAD_SCOPE_SYSTEM);
+	  pthread_t tid[5];
+	  for(int i=0; i< 5;i++) {
+	     pthread_create(&tid[i], &attr, (void *(*)(void *))poolSlave, (void *)masterSocket);
+	     pthread_join(tid[i], NULL);
+	  }
+	}
+}
+
+void poolSlave(int socket){
+  while(1) {
+      struct sockaddr_in clientIPAddress;
+      int alen = sizeof( clientIPAddress );
+      pthread_mutex_lock(&mutex);
+      int slaveSocket = accept( socket, (struct sockaddr *)&clientIPAddress, (socklen_t*)&alen);
+      if ( slaveSocket < 0 ) {
+         perror( "accept" );
+         exit( -1 );
+      }
+      pthread_mutex_unlock(&mutex);
+      processRequest(slaveSocket);
+      close(slaveSocket);
+   }
+} 
+
+void processRequestThread(int socket) {
+   processRequest(socket);
+   close(socket);
+}
+
+void processRequest(int fd) {
+	int n;
+	int length = 0;
+	int crlf_flag = 0;
+	int cgi_flag = 0;
+	int iteration_count = 0;
+	char *docPath = NULL;
+	char *request_type = NULL;
+	char *query_string = NULL;
+	char newChar;
+	char lastChar = 0;
+	char *currString = (char *)malloc(sizeof(char) * 1024);
+	//
+	// The client should send <name><cr><lf>
+	// Read the name of the client character by character until a
+	// <CR><LF> is found.
+	//
+  while ((n=read(fd, &newChar, sizeof(newChar))) > 0) {
+   	iteration_count++;
+    if (newChar == ' ') {
+    	currString[length] = '\0';
+      length = 0;
+      if (request_type == NULL) {
+        request_type = strdup(currString);
+      }
+			else if(docPath == NULL) {
+			  if (!strcmp(currString,(char *)"/")) { docPath = (char *)"/index.html"; }
+			  else { docPath = strdup(currString); }
+			}
+			else if (cgi_flag && query_string == NULL) {
+      	query_string = strdup(currString);
+      }
+    }
+    // Handle case of cgi docpath
+    else if (newChar == '?') {
+    	docPath = strdup(currString);
+    	cgi_flag = 1;
+    }
+    // Check for two crlf's in a row which signals end of request.
+    else if ( lastChar == '\015' && newChar == '\012' ) {
+      if (iteration_count-2 == crlf_flag) { break; }
+      else { crlf_flag = iteration_count; }
+    }
+    else {
+			currString[length++] = newChar;
+			lastChar = newChar;
+	  }
+  }
+
+	// Get the absolute filepath
+	char *cwd = (char *)malloc(sizeof(char)*256);
+	cwd = getcwd(cwd,256);
+	char *filePath = (char *)malloc(sizeof(char)*(length + strlen(cwd) + 20));
+
+	if (!strncmp(docPath,"/icon",5) || !strncmp(docPath, "/htdocs",7)) {
+	  strcpy(filePath,cwd);
+	  strcat(filePath,"/http-root-dir");
+	  strcat(filePath,docPath);
+	}
+	else if(!strncmp(docPath,"/cgi-bin",8)) {
+		strcpy(filePath,cwd);
+		strcat(filePath,"/http-root-dir");
+		strcat(filePath,docPath);
+	}
+	else {
+	  strcpy(filePath,cwd);
+	  strcat(filePath,"/http-root-dir/htdocs");
+	  strcat(filePath, docPath);
+	}
+
+	// Test if a directory
+	DIR *dir = opendir(filePath);
+	if (dir) {
+	  if (docPath[strlen(docPath)-1] != '/')
+	    docPath = (char *)realloc(docPath,(strlen(docPath)+1)*sizeof(char));
+	  browseDirectory(fd, dir, filePath);
+	  return;
+	}
+
+	// Code to get content type
+	char *contentType = (char *)malloc(sizeof(char) * 11);
+	fprintf(stderr, "cmp = %d\n",cmpReversedString(filePath, (char *)".html"));
+	if(!cmpReversedString(filePath, (char *)".html") || !cmpReversedString(filePath,(char *)".html/"))
+	  strcpy(contentType,"text/html");
+	else if(!cmpReversedString(filePath,(char *)".gif") || !cmpReversedString(filePath,(char *)".gif/"))
+	  strcpy(contentType, "image/gif"); 
+	else
+	  strcpy(contentType, "text/plain");
+
+	int file = open(filePath, O_RDONLY);
+	fprintf(stderr,"file path is %s | file descriptor = %d\n",filePath, file);
+	// Return 404 if the file is not found
+	if (file == -1)
+	  write404(fd);
+	else
+	  writeRequest(fd, file, strdup(docPath), strdup(contentType));
+
+	return;
+	}
+
+	// Compare the suffix of the string for the given file extension.
+	int cmpReversedString(char *s, char *fileExt) {
+	int i;
+	int sIndex = strlen(s) - 1;
+	int feIndex = strlen(fileExt) - 1;
+	for (i = feIndex; i >= 0 ; i--) {
+	if (s[sIndex--] != fileExt[feIndex--])
+	  return 1;
+	}
+	return 0;
+}
+
+
+
+
+
+
+
+
